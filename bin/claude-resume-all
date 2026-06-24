@@ -122,6 +122,16 @@ PROJ="${PROJ:A}"
 enc() { print -r -- "$1" | sed 's/[^a-zA-Z0-9]/-/g' }
 file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0 }
 
+cwd_of() {                      # exact launch dir recorded inside a .jsonl
+  local c=""
+  [[ -f "$1" ]] && c="$(python3 -c "import json,sys
+for l in open(sys.argv[1]):
+    try: o=json.loads(l)
+    except: continue
+    if o.get('cwd'): print(o['cwd']); break" "$1" 2>/dev/null || true)"
+  [[ -n "$c" ]] && print -r -- "$c" || print -r -- "$2"
+}
+
 label_of() {                    # first human user line of a .jsonl
   [[ -f "$1" ]] || { print -r -- ""; return }
   python3 - "$1" <<'PY' 2>/dev/null || true
@@ -209,7 +219,7 @@ else
     fi
     CONFIG_DIR="${PDIR[${found[1]}]}"
   fi
-  for jf in $(proj_files "$CONFIG_DIR"); do add_job "$CONFIG_DIR" "$PROJ" "$jf"; done
+  for jf in $(proj_files "$CONFIG_DIR"); do add_job "$CONFIG_DIR" "$(cwd_of "$jf" "$PROJ")" "$jf"; done
   HEADER="Profile : $(profile_name_for "$CONFIG_DIR")  ($CONFIG_DIR)"
 fi
 
