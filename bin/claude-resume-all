@@ -1,0 +1,356 @@
+#!/usr/bin/env zsh
+#
+# claude-resume-all — reopen Claude Code sessions of a project, each in its own
+# terminal, running `claude --resume <id>`.
+#
+# Claude Code's `/resume` (and `claude --resume`) brings back ONE session at a
+# time. When your editor or terminal crashes with several Claude threads going,
+# this fans them back out at once. It is config-free by default: it discovers
+# your Claude config dirs (~/.claude and ~/.claude-*) with no personal paths
+# baked in.
+#
+# USAGE
+#   claude-resume-all                 # all sessions for $PWD (profile auto-detected)
+#   claude-resume-all /path/to/proj   # another project directory
+#   claude-resume-all -p work         # force a named profile
+#   claude-resume-all --recover       # ONLY sessions killed by a crash (see below)
+#   claude-resume-all --recent 3h     # only sessions active in the last 3 hours
+#   claude-resume-all --since 14:30   # only sessions active since a time today
+#   claude-resume-all --order old     # open oldest-first (last-worked ends frontmost)
+#   claude-resume-all --recursive     # also sessions started in sub-directories
+#   claude-resume-all --list          # list, open nothing
+#   claude-resume-all --app vscode    # terminal | iterm | vscode | print
+#   claude-resume-all -y              # skip the confirmation prompt
+#
+# CRASH RECOVERY (--recover)
+#   While running, each session writes <config-dir>/sessions/<pid>.json (with its
+#   sessionId and cwd). A clean exit removes that file; a force-quit/crash leaves
+#   it behind. So "file present but pid dead" == a session that was open when
+#   things died. --recover resumes exactly those (skipping cleanly-exited AND
+#   still-running ones), using the recorded cwd. Run it SOON after a crash:
+#   Claude Code periodically sweeps stale entries, after which use --recent as a
+#   durable fallback (it filters on each session file's last-modified time).
+#   --recover scans the chosen profile (or all profiles) and, by default, only
+#   the current project; add --all-projects for everything.
+#
+# TERMINAL BACKENDS (--app):  terminal (default) | iterm | vscode | print
+#   vscode writes a transient .vscode/tasks.json; run the generated "Resume ALL"
+#   task once in VS Code, then press Enter here to remove it (--keep to leave it).
+#
+# PROFILES: a profile is a Claude config dir; basename is the name
+#   (~/.claude -> default, ~/.claude-work -> work). Optional config file:
+#   ${XDG_CONFIG_HOME:-~/.config}/claude-resume-all/config  (key=value):
+#     app=terminal / launcher=claude / profile.foo=~/dir / launcher.foo=claude-foo
+#
+# ENV: CLAUDE_RA_APP, CLAUDE_RA_LAUNCHER, CLAUDE_CONFIG_DIR, CLAUDE_BIN
+#
+set -euo pipefail
+setopt interactive_comments
+
+die() { print -u2 -- "claude-resume-all: $*"; exit 1 }
+
+# ---------------------------------------------------------------------------
+# defaults + optional config file
+# ---------------------------------------------------------------------------
+APP="terminal"; LAUNCHER="claude"; ORDER="recent"
+typeset -A PDIR PLAUNCH
+expand_tilde() { print -r -- "${1/#\~/$HOME}" }
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/claude-resume-all/config"
+if [[ -f "$CONF" ]]; then
+  while IFS='=' read -r key val; do
+    key="${key## }"; key="${key%% }"; val="${val## }"; val="${val%% }"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    case "$key" in
+      app)        APP="$val" ;;
+      launcher)   LAUNCHER="$val" ;;
+      order)      ORDER="$val" ;;
+      profile.*)  PDIR[${key#profile.}]="$(expand_tilde "$val")" ;;
+      launcher.*) PLAUNCH[${key#launcher.}]="$val" ;;
+    esac
+  done < "$CONF"
+fi
+[[ -n "${CLAUDE_RA_APP:-}" ]]      && APP="$CLAUDE_RA_APP"
+[[ -n "${CLAUDE_RA_LAUNCHER:-}" ]] && LAUNCHER="$CLAUDE_RA_LAUNCHER"
+
+# discover profiles from ~/.claude and ~/.claude-*
+for d in "$HOME"/.claude "$HOME"/.claude-*(N); do
+  [[ -d "$d/projects" ]] || continue
+  base="${d:t}"
+  if [[ "$base" == ".claude" ]]; then nm="default"; else nm="${base#.claude-}"; fi
+  [[ -n "${PDIR[$nm]:-}" ]] || PDIR[$nm]="$d"
+done
+
+profile_name_for() {            # config dir -> profile name (reverse lookup)
+  local cd="$1" n
+  for n in "${(@k)PDIR}"; do [[ "${PDIR[$n]}" == "$cd" ]] && { print -r -- "$n"; return } done
+  local b="${cd:t}"
+  if [[ "$b" == ".claude" ]]; then print -r -- default
+  elif [[ "$b" == .claude-* ]]; then print -r -- "${b#.claude-}"
+  else print -r -- "$b"; fi
+}
+
+# ---------------------------------------------------------------------------
+# parse args
+# ---------------------------------------------------------------------------
+PROJ="$PWD"; PROFILE=""; ADHOC_DIR=""
+LIST_ONLY=0; ASSUME_YES=0; KEEP=0; RECOVER=0; RECURSIVE=0; ALL_PROJECTS=0
+SINCE=""; RECENT=""
+while (( $# )); do
+  case "$1" in
+    -p|--profile)    PROFILE="$2"; shift 2; continue ;;
+    --config-dir)    ADHOC_DIR="$(expand_tilde "$2")"; shift 2; continue ;;
+    --app)           APP="$2"; shift 2; continue ;;
+    --order)         ORDER="$2"; shift 2; continue ;;
+    --since)         SINCE="$2"; shift 2; continue ;;
+    --recent)        RECENT="$2"; shift 2; continue ;;
+    --recover)       RECOVER=1 ;;
+    --recursive|-r)  RECURSIVE=1 ;;
+    --all-projects)  ALL_PROJECTS=1 ;;
+    --list)          LIST_ONLY=1 ;;
+    --keep)          KEEP=1 ;;
+    -y|--yes)        ASSUME_YES=1 ;;
+    -h|--help)       awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
+    -*)              die "unknown option: $1  (try --help)" ;;
+    *)               PROJ="$1" ;;
+  esac
+  shift
+done
+PROJ="${PROJ:A}"
+(( RECOVER && ALL_PROJECTS )) || [[ -d "$PROJ" ]] || die "not a directory: $PROJ"
+
+enc() { print -r -- "$1" | sed 's/[^a-zA-Z0-9]/-/g' }
+file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0 }
+
+label_of() {                    # first human user line of a .jsonl
+  [[ -f "$1" ]] || { print -r -- ""; return }
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import json,sys,re
+for line in open(sys.argv[1]):
+    try: o=json.loads(line)
+    except: continue
+    if o.get("type")=="user":
+        m=o.get("message",{}); c=m.get("content")
+        t=c if isinstance(c,str) else (" ".join(x.get("text","") for x in c if isinstance(x,dict)) if isinstance(c,list) else "")
+        t=re.sub(r"\s+"," ",t).strip().lstrip("❯ ").strip()
+        t=re.sub(r"^/(Users|home)/\S+\s*","",t)
+        if t and not t.startswith("<"):
+            print(t[:50]); break
+PY
+}
+
+# time threshold (epoch); 0 = no filter
+THRESHOLD=0
+if [[ -n "$RECENT" ]]; then
+  [[ "$RECENT" =~ '^([0-9]+)([smhd])$' ]] || die "bad --recent: $RECENT (e.g. 90m, 3h, 1d)"
+  n="${match[1]}"; u="${match[2]}"
+  case "$u" in s) f=1;; m) f=60;; h) f=3600;; d) f=86400;; esac
+  THRESHOLD=$(( $(date +%s) - n*f ))
+elif [[ -n "$SINCE" ]]; then
+  if [[ "$SINCE" =~ '^[0-9]{9,}$' ]]; then THRESHOLD="$SINCE"
+  elif [[ "$SINCE" =~ '^[0-9]{1,2}:[0-9]{2}$' ]]; then THRESHOLD=$(date -j -f "%Y-%m-%d %H:%M" "$(date +%Y-%m-%d) $SINCE" +%s 2>/dev/null) || die "bad --since time"
+  else THRESHOLD=$(date -j -f "%Y-%m-%d %H:%M" "$SINCE" +%s 2>/dev/null) || die "bad --since (use HH:MM or 'YYYY-MM-DD HH:MM')"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# build the job list:  each line = configdir \t cwd \t id \t mtime \t jsonl
+# ---------------------------------------------------------------------------
+JOBS=()
+add_job() {  # configdir cwd jsonl
+  local cd="$1" cwd="$2" jf="$3" id="${3:t:r}"
+  JOBS+=("$cd"$'\t'"$cwd"$'\t'"$id"$'\t'"$(file_mtime "$jf")"$'\t'"$jf")
+}
+
+HEADER=""
+if (( RECOVER )); then
+  # which config dirs to scan
+  scandirs=()
+  if [[ -n "$ADHOC_DIR" ]]; then scandirs=("$ADHOC_DIR")
+  elif [[ -n "$PROFILE" ]]; then [[ -n "${PDIR[$PROFILE]:-}" ]] || die "unknown profile: $PROFILE"; scandirs=("${PDIR[$PROFILE]}")
+  elif [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then scandirs=("$CLAUDE_CONFIG_DIR")
+  else scandirs=("${(@v)PDIR}"); fi
+  for cd in "${scandirs[@]}"; do
+    for rf in "$cd"/sessions/*.json(N); do
+      pid="${rf:t:r}"
+      [[ "$pid" == <-> ]] || continue          # numeric pid filenames only
+      kill -0 "$pid" 2>/dev/null && continue     # still running -> skip
+      jcwd=""; jid=""
+      IFS=$'\t' read -r jcwd jid <<< "$(python3 -c "import json;d=json.load(open('$rf'));print('%s\t%s'%(d.get('cwd',''),d.get('sessionId','')))" 2>/dev/null || true)"
+      [[ -n "$jid" ]] || continue
+      if (( ! ALL_PROJECTS )); then
+        if (( RECURSIVE )); then [[ "$jcwd" == "$PROJ" || "$jcwd" == "$PROJ"/* ]] || continue
+        else [[ "$jcwd" == "$PROJ" ]] || continue; fi
+      fi
+      add_job "$cd" "$jcwd" "$cd/projects/$(enc "$jcwd")/$jid.jsonl"
+    done
+  done
+  HEADER="Mode    : recover (force-closed sessions)$( (( ALL_PROJECTS )) && print -n ', all projects' || print -n ", project=$PROJ")"
+else
+  # normal: resolve one config dir, gather this project's sessions
+  proj_files() {  # configdir -> matching .jsonl paths
+    local dir="$1" e
+    e="$(enc "$PROJ")"
+    print -l "$dir/projects/$e"/*.jsonl(N)
+    (( RECURSIVE )) && print -l "$dir/projects/$e-"*/*.jsonl(N)
+  }
+  CONFIG_DIR=""
+  if [[ -n "$ADHOC_DIR" ]]; then CONFIG_DIR="$ADHOC_DIR"
+  elif [[ -n "$PROFILE" ]]; then [[ -n "${PDIR[$PROFILE]:-}" ]] || die "unknown profile: $PROFILE  (known: ${(k)PDIR})"; CONFIG_DIR="${PDIR[$PROFILE]}"
+  elif [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then CONFIG_DIR="$CLAUDE_CONFIG_DIR"
+  else
+    found=()
+    for nm in "${(@k)PDIR}"; do (( $(proj_files "${PDIR[$nm]}" | grep -c . ) )) && found+=("$nm"); done
+    if (( ${#found} == 0 )); then die "no sessions found for $PROJ (try --recursive, or -p / --recover)"
+    elif (( ${#found} > 1 )); then
+      print -u2 "Sessions exist under multiple profiles: ${(o)found}"
+      for n in "${(o)found}"; do print -u2 "  re-run with:  claude-resume-all -p $n"; done
+      exit 2
+    fi
+    CONFIG_DIR="${PDIR[${found[1]}]}"
+  fi
+  for jf in $(proj_files "$CONFIG_DIR"); do add_job "$CONFIG_DIR" "$PROJ" "$jf"; done
+  HEADER="Profile : $(profile_name_for "$CONFIG_DIR")  ($CONFIG_DIR)"
+fi
+
+# time filter
+if (( THRESHOLD > 0 )); then
+  filtered=()
+  for j in "${JOBS[@]}"; do mt="${${(s:	:)j}[4]}"; (( mt >= THRESHOLD )) && filtered+=("$j"); done
+  JOBS=("${filtered[@]}")
+fi
+
+(( ${#JOBS} )) || die "no matching sessions$( (( RECOVER )) && print -n ' (nothing was force-closed, or stale entries were already swept — try --recent)')"
+
+# order by mtime (4th field)
+if [[ "$ORDER" == old || "$ORDER" == oldest ]]; then
+  JOBS=("${(@f)$(print -l -- "${JOBS[@]}" | sort -t$'\t' -k4,4n)}")
+else
+  JOBS=("${(@f)$(print -l -- "${JOBS[@]}" | sort -t$'\t' -k4,4nr)}")
+fi
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+print "Project : $PROJ"
+print "$HEADER"
+print "Order   : $ORDER$( (( THRESHOLD>0 )) && print -n "   (filtered: ${SINCE:-$RECENT})")"
+print "Sessions: ${#JOBS}"
+for j in "${JOBS[@]}"; do
+  fields=("${(@s:	:)j}"); id="${fields[3]}"; jf="${fields[5]}"
+  printf '  %s  %s\n' "${id:0:8}" "$(label_of "$jf")"
+done
+(( LIST_ONLY )) && exit 0
+
+# ---------------------------------------------------------------------------
+# per-job resume command
+# ---------------------------------------------------------------------------
+build_cmd() {  # configdir cwd id
+  local cd="$1" cwd="$2" id="$3" run="$LAUNCHER" inject=1 pn prefix=""
+  pn="$(profile_name_for "$cd")"
+  [[ -n "${PLAUNCH[$pn]:-}" ]] && { run="${PLAUNCH[$pn]}"; inject=0 }
+  (( inject )) && [[ "$cd" != "$HOME/.claude" ]] && prefix="CLAUDE_CONFIG_DIR=${(q)cd} "
+  print -r -- "cd ${(q)cwd} && ${prefix}${run} --resume $id"
+}
+osa_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; print -r -- "$s" }
+
+# confirm
+if (( ! ASSUME_YES )) && [[ "$APP" != print ]]; then
+  case "$APP" in
+    vscode) read 'ans?Write .vscode/tasks.json for '"${#JOBS}"' session(s)? [y/N] ' ;;
+    *)      read 'ans?Open '"${#JOBS}"' '"$APP"' window(s)? [y/N] ' ;;
+  esac
+  [[ "$ans" == [yY]* ]] || { print "Aborted."; exit 0 }
+fi
+
+# ---------------------------------------------------------------------------
+# fan out
+# ---------------------------------------------------------------------------
+case "$APP" in
+  print)
+    for j in "${JOBS[@]}"; do f=("${(@s:	:)j}"); build_cmd "${f[1]}" "${f[2]}" "${f[3]}"; done
+    ;;
+  terminal)
+    for j in "${JOBS[@]}"; do f=("${(@s:	:)j}")
+      esc="$(osa_escape "$(build_cmd "${f[1]}" "${f[2]}" "${f[3]}")")"
+      osascript -e "tell application \"Terminal\" to do script \"$esc\"" >/dev/null
+    done
+    osascript -e 'tell application "Terminal" to activate' >/dev/null
+    print "Launched ${#JOBS} session(s)."
+    ;;
+  iterm)
+    for j in "${JOBS[@]}"; do f=("${(@s:	:)j}")
+      esc="$(osa_escape "$(build_cmd "${f[1]}" "${f[2]}" "${f[3]}")")"
+      osascript -e 'tell application "iTerm"' -e 'create window with default profile' \
+                -e "tell current session of current window to write text \"$esc\"" -e 'end tell' >/dev/null
+    done
+    osascript -e 'tell application "iTerm" to activate' >/dev/null
+    print "Launched ${#JOBS} session(s)."
+    ;;
+  vscode)
+    (( $+commands[python3] )) || die "--app vscode needs python3"
+    CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+    [[ -n "$CLAUDE_BIN" && -x "$CLAUDE_BIN" ]] || die "can't find 'claude' for tasks.json (set CLAUDE_BIN=/abs/path)"
+    tsv="$(mktemp)"
+    for j in "${JOBS[@]}"; do f=("${(@s:	:)j}")
+      printf '%s\t%s\t%s\t%s\n' "${f[1]}" "${f[2]}" "${f[3]}" "$(label_of "${f[5]}")" >> "$tsv"
+    done
+    vsdir="$PROJ/.vscode"; tasksf="$vsdir/tasks.json"
+    had_vsdir=0; [[ -d "$vsdir" ]] && had_vsdir=1
+    backup=""; [[ -f "$tasksf" ]] && { backup="$(mktemp)"; cp "$tasksf" "$backup" }
+    COMPOUND="▶ Resume ALL ($( (( RECOVER )) && print -n recovered || profile_name_for "${${(@s:	:)JOBS[1]}[1]}"))"
+    python3 - "$tsv" "$CLAUDE_BIN" "$tasksf" "$COMPOUND" <<'PY'
+import json, os, sys
+tsv, claude_bin, out, compound = sys.argv[1:5]
+default_dir = os.path.expanduser("~/.claude")
+MARK = "↻ "
+rows = [l.rstrip("\n").split("\t") for l in open(tsv) if l.strip()]
+tasks, deps = [], []
+for i, r in enumerate(rows, 1):
+    cd, cwd, sid, label = (r + ["", "", "", ""])[:4]
+    lbl = f"{MARK}{i:02d} {label or sid[:8]}"
+    deps.append(lbl)
+    t = {"label": lbl, "type": "shell",
+         "command": f"{claude_bin} --resume {sid}",
+         "options": {"cwd": cwd},
+         "presentation": {"panel": "dedicated", "group": "claude-resume",
+                          "reveal": "always", "focus": False, "echo": False},
+         "problemMatcher": []}
+    if os.path.realpath(cd) != os.path.realpath(default_dir):
+        t["options"]["env"] = {"CLAUDE_CONFIG_DIR": cd}
+    tasks.append(t)
+tasks.append({"label": compound, "dependsOn": deps,
+              "dependsOrder": "parallel", "problemMatcher": []})
+doc = {"version": "2.0.0", "tasks": []}
+if os.path.exists(out):
+    try: doc = json.load(open(out))
+    except Exception: pass
+    if not isinstance(doc.get("tasks"), list): doc["tasks"] = []
+doc.setdefault("version", "2.0.0")
+doc["tasks"] = [t for t in doc["tasks"]
+                if not str(t.get("label","")).startswith((MARK, "▶ Resume ALL"))]
+doc["tasks"].extend(tasks)
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as fh:
+    json.dump(doc, fh, ensure_ascii=False, indent=2); fh.write("\n")
+print(f"  wrote {len(deps)} session tasks + compound: {compound}")
+PY
+    rm -f "$tsv"
+    print ""
+    print "In VS Code (with the project open):"
+    print "  Cmd+Shift+P -> 'Tasks: Run Task' (JP: タスク: タスクの実行) -> '$COMPOUND'"
+    print ""
+    if (( KEEP )); then
+      print "Kept $tasksf (--keep)."; [[ -n "$backup" ]] && rm -f "$backup"
+    elif [[ ! -t 0 ]]; then
+      print "Non-interactive: leaving $tasksf — delete it once the terminals open."; [[ -n "$backup" ]] && rm -f "$backup"
+    else
+      read 'ans?Press Enter AFTER the terminals open to clean up tasks.json (Ctrl-C to keep)... '
+      if [[ -n "$backup" ]]; then cp "$backup" "$tasksf"; rm -f "$backup"; print "Restored your original tasks.json."
+      else rm -f "$tasksf"; (( had_vsdir )) || rmdir "$vsdir" 2>/dev/null || true; print "Removed the temporary tasks.json."; fi
+    fi
+    ;;
+  *)
+    die "unknown --app: $APP  (use terminal | iterm | vscode | print)"
+    ;;
+esac

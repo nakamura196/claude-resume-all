@@ -1,0 +1,21 @@
+# claude-resume-all config (optional)
+#
+# Copy to:  ${XDG_CONFIG_HOME:-~/.config}/claude-resume-all/config
+# All keys are optional; the tool works with no config at all.
+#
+# key=value lines, '#' for comments.
+
+# Default terminal backend: terminal | iterm | vscode | print
+app=terminal
+
+# Default executable to run for each session
+launcher=claude
+
+# Register an extra profile whose Claude config dir is in a non-standard
+# location (auto-discovery already covers ~/.claude and ~/.claude-*).
+# profile.<name>=<config-dir>
+#profile.foo=~/some/where/.claude-foo
+
+# Per-profile launcher override — e.g. point a profile at your own shell alias.
+# When set, the tool runs this verbatim instead of injecting CLAUDE_CONFIG_DIR.
+#launcher.foo=claude-foo
